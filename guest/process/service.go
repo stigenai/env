@@ -46,11 +46,12 @@ func (s *Service) StartProcess(ctx context.Context, req *ateenvv1alpha.StartProc
 	}
 
 	state, err := s.tracker.Start(StartOptions{
-		Command: req.GetCommand(),
-		Cwd:     req.GetCwd(),
-		Env:     req.GetEnv(),
-		Stdin:   req.GetStdin(),
-		Timeout: req.GetTimeout().AsDuration(),
+		Command:    req.GetCommand(),
+		Cwd:        req.GetCwd(),
+		Env:        req.GetEnv(),
+		Stdin:      req.GetStdin(),
+		Timeout:    req.GetTimeout().AsDuration(),
+		LiveOutput: req.GetLiveOutput(),
 	})
 	if err != nil {
 		return nil, rpcError(err, "")
@@ -126,28 +127,38 @@ type outputCursor struct {
 }
 
 func (c *outputCursor) flush() error {
-	data, next, err := ReadSpool(c.state.StdoutPath, c.stdout)
-	if err != nil {
-		return status.Errorf(codes.Internal, "reading stdout: %v", err)
+	if err := c.send(c.state.readStdout, &c.stdout, func(b []byte) *ateenvv1alpha.ProcessOutput {
+		return &ateenvv1alpha.ProcessOutput{Output: &ateenvv1alpha.ProcessOutput_Stdout{Stdout: b}}
+	}); err != nil {
+		return err
 	}
-	if len(data) > 0 {
-		if err := c.stream.Send(&ateenvv1alpha.ProcessOutput{Output: &ateenvv1alpha.ProcessOutput_Stdout{Stdout: data}}); err != nil {
-			return err
-		}
-	}
-	c.stdout = next
+	return c.send(c.state.readStderr, &c.stderr, func(b []byte) *ateenvv1alpha.ProcessOutput {
+		return &ateenvv1alpha.ProcessOutput{Output: &ateenvv1alpha.ProcessOutput_Stderr{Stderr: b}}
+	})
+}
 
-	data, next, err = ReadSpool(c.state.StderrPath, c.stderr)
-	if err != nil {
-		return status.Errorf(codes.Internal, "reading stderr: %v", err)
-	}
-	if len(data) > 0 {
-		if err := c.stream.Send(&ateenvv1alpha.ProcessOutput{Output: &ateenvv1alpha.ProcessOutput_Stderr{Stderr: data}}); err != nil {
+// send streams one output from *off. A liveBuffer read returns at most
+// liveChunk bytes, so a live output can take several reads.
+func (c *outputCursor) send(read func(int64) ([]byte, int64, error), off *int64, msg func([]byte) *ateenvv1alpha.ProcessOutput) error {
+	for {
+		data, next, err := read(*off)
+		if errors.Is(err, errDropped) {
+			return status.Errorf(codes.OutOfRange, "offset %d: %v", *off, err)
+		}
+		if err != nil {
+			return status.Errorf(codes.Internal, "reading output: %v", err)
+		}
+		if len(data) == 0 {
+			return nil
+		}
+		if err := c.stream.Send(msg(data)); err != nil {
 			return err
 		}
+		*off = next
+		if c.state.stdoutLive == nil || len(data) < liveChunk {
+			return nil // A spool read returns all it has; a short live read too.
+		}
 	}
-	c.stderr = next
-	return nil
 }
 
 // WriteProcessInput feeds stdin from a client stream. stdin stays open across

@@ -156,6 +156,13 @@ message StartProcessRequest {
   // Maximum wall-clock run time. On expiry the process group receives SIGKILL.
   // Unset or zero applies the guest's default timeout.
   google.protobuf.Duration timeout = 5;
+  // If true, stdout and stderr stay in a bounded memory buffer instead of the
+  // log spool, and have no total byte cap. The process blocks on write while
+  // 4 MiB is not yet streamed. The last 4 MiB already streamed stays, so a
+  // client can resume at an offset after a broken stream; an older offset
+  // fails with OUT_OF_RANGE. Use it for a long-lived streamed process, such
+  // as `sshd -i` behind an ssh ProxyCommand.
+  bool live_output = 6;
 }
 
 // Request to get a Process.

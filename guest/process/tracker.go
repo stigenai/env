@@ -121,6 +121,9 @@ type StartOptions struct {
 	// Timeout kills the process group after this duration. Zero uses the
 	// tracker's DefaultProcessTimeout.
 	Timeout time.Duration
+	// LiveOutput keeps stdout and stderr in memory (liveBuffer) with no
+	// total byte cap and no spool file.
+	LiveOutput bool
 }
 
 // ProcessState tracks the execution state and I/O handles of a process.
@@ -137,6 +140,9 @@ type ProcessState struct {
 
 	StdoutPath string
 	StderrPath string
+
+	stdoutLive *liveBuffer // set instead of the spool paths for LiveOutput
+	stderrLive *liveBuffer
 
 	stdinMu     sync.Mutex
 	stdin       io.WriteCloser // nil when started without stdin
@@ -317,29 +323,32 @@ func (t *Tracker) Start(opts StartOptions) (*ProcessState, error) {
 	t.mu.Unlock()
 
 	processID := t.generateUniqueID()
-	stdoutPath := filepath.Join(t.config.LogDir, processID+".stdout")
-	stderrPath := filepath.Join(t.config.LogDir, processID+".stderr")
-
-	stdoutFile, err := os.OpenFile(stdoutPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		t.decrementActive()
-		return nil, fmt.Errorf("creating stdout log: %w", err)
-	}
-	stderrFile, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		stdoutFile.Close()
-		t.decrementActive()
-		return nil, fmt.Errorf("creating stderr log: %w", err)
-	}
-
 	state := &ProcessState{
-		ProcessID:  processID,
-		Command:    append([]string(nil), opts.Command...),
-		State:      ateenvv1alpha.ProcessState_PROCESS_STATE_RUNNING,
-		StdoutPath: stdoutPath,
-		StderrPath: stderrPath,
-		output:     newNotifier(),
-		done:       make(chan struct{}),
+		ProcessID: processID,
+		Command:   append([]string(nil), opts.Command...),
+		State:     ateenvv1alpha.ProcessState_PROCESS_STATE_RUNNING,
+		output:    newNotifier(),
+		done:      make(chan struct{}),
+	}
+	var stdoutFile, stderrFile *os.File
+	if opts.LiveOutput {
+		state.stdoutLive = newLiveBuffer(state.output.notify)
+		state.stderrLive = newLiveBuffer(state.output.notify)
+	} else {
+		state.StdoutPath = filepath.Join(t.config.LogDir, processID+".stdout")
+		state.StderrPath = filepath.Join(t.config.LogDir, processID+".stderr")
+		var err error
+		stdoutFile, err = os.OpenFile(state.StdoutPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			t.decrementActive()
+			return nil, fmt.Errorf("creating stdout log: %w", err)
+		}
+		stderrFile, err = os.OpenFile(state.StderrPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			stdoutFile.Close()
+			t.decrementActive()
+			return nil, fmt.Errorf("creating stderr log: %w", err)
+		}
 	}
 
 	cmd := exec.Command(opts.Command[0], opts.Command[1:]...)
@@ -356,8 +365,12 @@ func (t *Tracker) Start(opts StartOptions) (*ProcessState, error) {
 	}
 	// Wrap output writers with byte limiters to prevent disk fill-up and
 	// wake output streamers on every write.
-	cmd.Stdout = &cappedWriter{w: stdoutFile, limit: t.config.MaxLogBytes, onWrite: state.output.notify}
-	cmd.Stderr = &cappedWriter{w: stderrFile, limit: t.config.MaxLogBytes, onWrite: state.output.notify}
+	if opts.LiveOutput {
+		cmd.Stdout, cmd.Stderr = state.stdoutLive, state.stderrLive
+	} else {
+		cmd.Stdout = &cappedWriter{w: stdoutFile, limit: t.config.MaxLogBytes, onWrite: state.output.notify}
+		cmd.Stderr = &cappedWriter{w: stderrFile, limit: t.config.MaxLogBytes, onWrite: state.output.notify}
+	}
 	// Give the process its own group so signals reach the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -483,6 +496,11 @@ func (t *Tracker) Signal(processID string, sig syscall.Signal) error {
 
 	// Negative PID targets the whole process group (the leader's PGID == PID
 	// thanks to Setpgid).
+	if state.stdoutLive != nil && terminating(sig) {
+		// A blocked live_output writer must not keep an ending process alive.
+		state.stdoutLive.unblock()
+		state.stderrLive.unblock()
+	}
 	if err := syscall.Kill(-pid, sig); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return ErrExited
@@ -593,6 +611,31 @@ func (t *Tracker) forget(state *ProcessState) {
 	_ = os.Remove(state.StdoutPath)
 	_ = os.Remove(state.StderrPath)
 	delete(t.processes, state.ProcessID)
+}
+
+// terminating reports whether sig ends a process by default.
+func terminating(sig syscall.Signal) bool {
+	switch sig {
+	case syscall.SIGKILL, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT:
+		return true
+	}
+	return false
+}
+
+// readStdout and readStderr read a process's output from offset, from its
+// liveBuffer or its spool file.
+func (p *ProcessState) readStdout(offset int64) ([]byte, int64, error) {
+	if p.stdoutLive != nil {
+		return p.stdoutLive.Read(offset)
+	}
+	return ReadSpool(p.StdoutPath, offset)
+}
+
+func (p *ProcessState) readStderr(offset int64) ([]byte, int64, error) {
+	if p.stderrLive != nil {
+		return p.stderrLive.Read(offset)
+	}
+	return ReadSpool(p.StderrPath, offset)
 }
 
 // ReadSpool reads bytes from a log spool file starting at offset and returns
